@@ -1,0 +1,285 @@
+#include <Adafruit_NeoPixel.h>
+#include <FastLED.h>
+
+// powercell uses adafruit, cyclotron uses FastLED
+// pins designed for Arduino Uno
+
+#define NEO_POWER 3 // PWM for powercell
+#define POWER_COUNT 12
+Adafruit_NeoPixel powerStick = Adafruit_NeoPixel(POWER_COUNT, NEO_POWER, NEO_GRB + NEO_KHZ800);
+
+#define CYCLO_LEDS  75
+#define CYCLO_PIN   6 // PWM for cyclotron
+
+CRGB leds[CYCLO_LEDS];
+
+int SMOswitch = A0; // Switch Me On switch analog input
+
+uint8_t hue = 0;
+
+// PACK STATES
+bool powerBooted = false;   // has the pack booted up
+bool poweredDown = true;    // is the pack powered down
+
+// POWERCELL PARAMETERS
+const unsigned long pwr_boot_interval = 40;       // How fast to do the powercell drop animation on bootup 
+const unsigned long pwr_interval = 55;            // how fast the powercell cycles: One 14 led cycle per 756 ms
+const int powercellLedCount = 14;                                         // total number of led's in the animation
+const int powercellIndexOffset = 1;                                       // first led offset into the led chain for the animation
+
+// VENT PARAMTERS
+int ventLED = 7;    //this is the pin number for the ventLED
+int ventState = 1;
+unsigned long prevventMillis;
+unsigned long currentventMillis;
+
+void setup() {
+  // configure powercell
+  powerStick.begin();
+  powerStick.setBrightness(80);
+  powerStick.show(); // Initialize all pixels to 'off'
+  
+  // configure cyclotron
+  FastLED.addLeds<WS2812B, CYCLO_PIN, GRB>(leds, CYCLO_LEDS);
+  FastLED.setBrightness(80);
+  
+  //configure vent
+  pinMode(ventLED,OUTPUT);
+  digitalWrite(ventLED,1);
+
+  //configure switch
+  pinMode(SMOswitch, INPUT_PULLUP);
+  
+    Serial.begin(9600);
+}
+
+void loop() {
+  // get the current time
+  unsigned long currentMillis = millis();
+    //read the switch into a value
+    int switchVal = digitalRead(SMOswitch);
+      //print out the value of the pushbutton
+      Serial.println(switchVal);
+  if( switchVal == LOW) {
+      if( powerBooted == false ){
+        powerSequenceBoot(currentMillis);
+      } else {
+        powerSequenceOne(currentMillis, pwr_interval);
+      } 
+  } else {
+  powerSequenceShutdown(currentMillis, pwr_interval);
+  }
+    delay(1);
+}
+
+// POWERCELL trackers for the boot and shutdown
+unsigned long prevPwrBootMillis = 0;    // the last time we changed a powercell light in the boot sequence
+unsigned long prevPwrMillis = 0;        // last time we changed a powercell light in the idle sequence
+int powerSeqNum = 0;                // current running powercell sequence leds
+
+int currentBootLevel = 0;                          // current powercell boot level sequence led
+int currentLightLevel = powercellLedCount;         // current powercell boot light sequence led
+
+//CYCLOTRON Parameters and Trackers
+bool cyclotronStarted = false;
+unsigned long currentCycloBootPos = 0;
+unsigned long prevCycloBootMillis = 0;
+unsigned long currentCycloSpeed = 80;
+unsigned long maxCycloSpeed = 200;
+unsigned long cyclo_boot_increase = 50;
+unsigned long cyclo_boot_Wait;
+
+/* STARTUP / BOOT SEQUENCE */
+void powerSequenceBoot(unsigned long currentMillis) {
+  bool doPowercellUpdate = false;
+  
+  // START CYCLOTRON
+  cycloBoot(currentMillis);
+  // END CYCLOTRON
+
+  //START VENT
+  ventboot();
+  //END VENT
+
+  //START POWERCELL
+  if ((unsigned long)(currentMillis - prevPwrBootMillis) >= pwr_boot_interval) {
+    // save the last time you blinked the LED
+    prevPwrBootMillis = currentMillis;
+
+    if( currentBootLevel != powercellLedCount ){
+      if( currentBootLevel == currentLightLevel){
+        if(currentLightLevel+1 <= powercellLedCount){
+          powerStick.setPixelColor(currentLightLevel+1, 0);
+        }
+        powerStick.setPixelColor(currentBootLevel, powerStick.Color(0, 0, 255));
+        currentLightLevel = powercellLedCount;
+        currentBootLevel++;
+      }else{
+        if(currentLightLevel+1 <= powercellLedCount){
+          powerStick.setPixelColor(currentLightLevel+1, 0);
+        }
+        powerStick.setPixelColor(currentLightLevel, powerStick.Color(0, 0, 255));
+        currentLightLevel--;
+      }
+      doPowercellUpdate = true;
+    }else{
+      powerBooted = true;
+      currentBootLevel = 0;
+      currentLightLevel = powercellLedCount;
+    }
+  }
+      // END POWERCELL
+
+  // if we have changed an led
+  if( doPowercellUpdate == true ){
+    powerStick.show(); // commit all of the changes
+    
+  }
+}
+
+/* STASIS/IDLE SEQUENCE */
+void powerSequenceOne(unsigned long currentMillis, unsigned long anispeed) {
+  cycloLoop();
+  ventloop();
+  
+  // START POWERCELL
+  bool doPowercellUpdate = false;
+  if ((unsigned long)(currentMillis - prevPwrMillis) >= anispeed) {
+    // save the last time you blinked the LED
+    prevPwrMillis = currentMillis;
+
+    for ( int i = 0; i <= powercellLedCount; i++) {
+      if ( i <= powerSeqNum ) {
+        powerStick.setPixelColor(i, powerStick.Color(0, 0, 150));
+      } else {
+        powerStick.setPixelColor(i, 0);
+      }
+    }
+    
+    if ( powerSeqNum <= powercellLedCount) {
+      powerSeqNum++;
+    } else {
+      powerSeqNum = 0;
+    }
+
+    // Update the leds
+    powerStick.show();
+  }
+  // END POWERCELL
+}
+
+void powerSequenceShutdown (unsigned long currentMillis, unsigned long anispeed) {
+  if (cyclotronStarted == true) {
+  cycloShutdown(currentMillis);
+  ventshutdown ();
+  }else{
+    resetPack();
+  }
+}
+
+/* CYCLOTRON ANIMATIONS */
+void cycloBoot(unsigned long currentMillis) {
+cyclo_boot_Wait = (unsigned long) 60000/(currentCycloSpeed*CYCLO_LEDS);
+
+  if((unsigned long)(currentMillis - prevCycloBootMillis) >= cyclo_boot_Wait) {
+    // save the last time you blinked the LED
+    prevCycloBootMillis = currentMillis;
+    
+    fadeToBlackBy(leds, CYCLO_LEDS, 50);
+    FastLED.show();
+
+    if (currentCycloSpeed < maxCycloSpeed) {
+        if (currentCycloBootPos != CYCLO_LEDS-1) {
+        leds[currentCycloBootPos] = CRGB(255,0,0);
+        FastLED.show();
+        currentCycloBootPos++;
+    }else{
+        currentCycloBootPos = 0;
+        currentCycloSpeed = currentCycloSpeed+cyclo_boot_increase;
+      }       
+    }else{
+  currentCycloSpeed = maxCycloSpeed;
+  cycloLoop();
+    }
+  } 
+}
+
+void cycloLoop() {
+     uint8_t pos = map(beat16(maxCycloSpeed * 256, maxCycloSpeed), 0, 65535, 0, CYCLO_LEDS -1);
+  leds[pos] = CRGB( 255, 0, 0);
+
+  fadeToBlackBy(leds, CYCLO_LEDS, 25);
+
+  EVERY_N_MILLISECONDS(10) {
+    Serial.println(pos);
+  }
+  FastLED.show();
+}
+
+void cycloShutdown(unsigned long currentMillis) {
+cyclo_boot_Wait = (unsigned long) 60000/(currentCycloSpeed*CYCLO_LEDS);
+  cyclotronStarted = true;
+  if((unsigned long)(currentMillis - prevCycloBootMillis) >= cyclo_boot_Wait) {
+    // save the last time you blinked the LED
+    prevCycloBootMillis = currentMillis;
+    
+    fadeToBlackBy(leds, CYCLO_LEDS, 100);
+    FastLED.show();
+
+    if (currentCycloSpeed <= maxCycloSpeed) {
+        if (currentCycloBootPos != CYCLO_LEDS-1) {
+        leds[currentCycloBootPos] = CRGB(255,0,0);
+        FastLED.show();
+        currentCycloBootPos++;
+    }else{
+        currentCycloBootPos = 0;
+        currentCycloSpeed = currentCycloSpeed-cyclo_boot_increase;
+      }       
+    }else{
+  currentCycloSpeed = 0;
+  cyclotronStarted = false;
+    }
+  } 
+}
+
+/*VENT ANIMATIONS */
+void ventboot() {
+
+  currentventMillis = millis();
+  if (currentventMillis - prevventMillis >= 250) {
+    ventState = 1 - ventState;
+    prevventMillis = millis();
+    digitalWrite(ventLED, ventState);
+    Serial.print(prevventMillis);
+  }
+}
+
+void ventloop() {
+//   for blinking white vent light
+currentventMillis=millis();
+if (currentventMillis-prevventMillis >=1500){
+  ventState=1-ventState;
+  prevventMillis=millis();
+  digitalWrite(ventLED,ventState);
+  Serial.print(prevventMillis);
+  }
+}
+
+void ventshutdown() {
+  digitalWrite(ventLED, 1);
+}
+
+/*PACK RESET AFTER SHUTDOWN */
+void resetPack() {
+  powerBooted = false;
+  poweredDown = true;
+
+  // shutoff the leds
+  currentCycloSpeed = cyclo_boot_increase;
+  FastLED.clear(true);
+  
+  powerStick.clear();
+  powerStick.show();
+
+  digitalWrite(ventLED,0);
+  }
